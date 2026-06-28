@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# OS
+.DS_Store
+
+# Claude Code local settings
+.claude/settings.local.json
