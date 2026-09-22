@@ -1,0 +1,7 @@
+[project]
+name = "stock-analysis-app"
+version = "1.0.0"
+
+[tool.flet.android]
+target_arch = ["arm64-v8a"]
+extract_packages = ["matplotlib", "tzdata"]

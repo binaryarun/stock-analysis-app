@@ -9,10 +9,47 @@ needed for plotting (Flet renders its own native window separately).
 from __future__ import annotations
 import base64
 import io
+import os
+
+_ON_ANDROID = "ANDROID_ARGUMENT" in os.environ or "ANDROID_DATA" in os.environ
+
+if _ON_ANDROID:
+    # matplotlib.font_manager builds its font cache at *import* time
+    # (`fontManager = _load_fontmanager()` runs as soon as the module loads),
+    # and that unconditionally shells out to `fc-list`/`system_profiler` via
+    # subprocess. On Android, fork()/exec() are blocked by the OS sandbox and
+    # this crashes the whole app at the native level (not a catchable Python
+    # exception), so subprocess.check_output must be neutralized *before*
+    # matplotlib is imported at all - patching font_manager after the fact is
+    # too late. matplotlib still works fine with its bundled fonts.
+    import subprocess as _subprocess
+
+    def _no_subprocess(*args, **kwargs):
+        raise OSError("subprocess disabled on Android")
+
+    _real_check_output = _subprocess.check_output
+    _subprocess.check_output = _no_subprocess
+
+    # flet's Android build ships site-packages inside a zip (sitepackages.zip),
+    # so matplotlib's default rcParams loader - which does a plain open() on
+    # ".../matplotlib/mpl-data/matplotlibrc" assuming a real directory - fails
+    # with NotADirectoryError since that path lives inside the zip. Pointing
+    # MATPLOTLIBRC at an empty, real file on disk skips that lookup entirely;
+    # matplotlib just falls back to its compiled-in defaults.
+    import tempfile
+
+    _stub_rc = os.path.join(tempfile.gettempdir(), "matplotlibrc")
+    if not os.path.exists(_stub_rc):
+        with open(_stub_rc, "w"):
+            pass
+    os.environ["MATPLOTLIBRC"] = _stub_rc
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+if _ON_ANDROID:
+    _subprocess.check_output = _real_check_output
 
 from analysis import sma, rsi
 

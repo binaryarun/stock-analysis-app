@@ -16,6 +16,9 @@ This is a personal research tool only - it is not investment advice.
 """
 
 from __future__ import annotations
+import uuid
+from datetime import datetime
+
 import flet as ft
 
 import storage
@@ -25,6 +28,7 @@ from analysis import compute_technical_snapshot, screen_quote, TechnicalSnapshot
 from formatting import fmt_num, fmt_pct, fmt_compact, currency_symbol
 from charting import render_price_chart
 from macro import fetch_macro_snapshot
+import llm_summary
 
 def _border_all(width, color):
     side = ft.border.BorderSide(width=width, color=color)
@@ -61,7 +65,70 @@ def main(page: ft.Page):
         "macro_results": [],   # list[MacroSnapshot]
         "macro_loaded": False,
         "view": "watchlist",
+        "watchlist_filter": "All",
+        # General chat: a list of saved sessions (persisted to disk) plus
+        # which one is currently open. Each session:
+        # {"id", "title", "created_at", "messages": [{"role", "content"}]}
+        "chat_sessions": storage.load_chat_sessions(),
+        "current_chat_id": None,
+        "chat_panel_collapsed": False,
     }
+
+    def _new_chat_session() -> dict:
+        return {
+            "id": uuid.uuid4().hex,
+            "title": "New chat",
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "messages": [],
+        }
+
+    def _bump_to_top(chat_id: str) -> None:
+        """Keeps the active/just-updated session pinned at the top of the
+        history list, so it doesn't sink down as it accumulates replies."""
+        sessions = state["chat_sessions"]
+        for i, s in enumerate(sessions):
+            if s["id"] == chat_id:
+                if i != 0:
+                    sessions.insert(0, sessions.pop(i))
+                break
+
+    def get_current_chat() -> dict:
+        """Returns the active chat session, creating one if none exists yet."""
+        cid = state["current_chat_id"]
+        for s in state["chat_sessions"]:
+            if s["id"] == cid:
+                return s
+        # No active session (first run, or it was deleted) - start a fresh one.
+        session = _new_chat_session()
+        state["chat_sessions"].insert(0, session)
+        state["current_chat_id"] = session["id"]
+        return session
+
+    def start_new_chat(e=None):
+        session = _new_chat_session()
+        state["chat_sessions"].insert(0, session)
+        state["current_chat_id"] = session["id"]
+        storage.save_chat_sessions(state["chat_sessions"])
+        refresh_body()
+        page.update()
+
+    def toggle_chat_panel(e=None):
+        state["chat_panel_collapsed"] = not state["chat_panel_collapsed"]
+        refresh_body()
+        page.update()
+
+    def select_chat(chat_id: str):
+        state["current_chat_id"] = chat_id
+        refresh_body()
+        page.update()
+
+    def delete_chat(chat_id: str, e=None):
+        state["chat_sessions"] = [s for s in state["chat_sessions"] if s["id"] != chat_id]
+        if state["current_chat_id"] == chat_id:
+            state["current_chat_id"] = None
+        storage.save_chat_sessions(state["chat_sessions"])
+        refresh_body()
+        page.update()
 
     status_text = ft.Text("", size=12, color=ft.Colors.GREY_700)
     progress = ft.ProgressRing(width=16, height=16, visible=False)
@@ -72,14 +139,20 @@ def main(page: ft.Page):
     macro_status = ft.Text("", size=12, color=ft.Colors.GREY_700)
     macro_progress = ft.ProgressRing(width=16, height=16, visible=False)
 
+    chat_input_field = ft.TextField(hint_text="Ask about market concepts, indicators, strategy...",
+                                     expand=True, dense=True)
+    chat_send_btn = ft.Button("Send", icon=ft.Icons.SEND)
+    chat_progress = ft.ProgressRing(width=16, height=16, visible=False)
+
     body = ft.Container(expand=True)
 
     # ------------------------------------------------------------------
     # Detail dialog (shared by Watchlist + Screener)
     # ------------------------------------------------------------------
-    def show_detail(q: Quote, snap: TechnicalSnapshot):
+    def show_detail(q: Quote, snap: TechnicalSnapshot, category: str | None = None):
         sym = currency_symbol(q.currency)
         chart_b64 = render_price_chart(q.history, q.ticker, sym)
+        category = category or screen_quote(q, snap).category
 
         stats_rows = [
             ("Price", f"{sym}{fmt_num(q.price)}"),
@@ -115,13 +188,86 @@ def main(page: ft.Page):
             right_controls.append(ft.Text("No chart data available.", size=12,
                                            color=ft.Colors.GREY_600))
 
+        # -- "Explain this" chat (local LLM, optional feature) -----------
+        chat_history: list[dict] = []  # [{"role": "user"/"assistant", "content": ...}]
+        chat_transcript = ft.Column(spacing=6, tight=True)
+        chat_progress = ft.ProgressRing(width=14, height=14, visible=False)
+        chat_disclaimer = ft.Text(llm_summary.DISCLAIMER, size=10,
+                                   color=ft.Colors.GREY_600, visible=False)
+        chat_input = ft.TextField(hint_text="Ask a follow-up question about this stock...",
+                                   expand=True, dense=True)
+        send_button = ft.IconButton(icon=ft.Icons.SEND)
+        explain_button = ft.TextButton("Explain this", icon=ft.Icons.AUTO_AWESOME,
+                                        visible=False)
+        chat_row = ft.Row([chat_input, send_button, chat_progress], visible=False)
+
+        def send_chat(e=None, preset_question: str | None = None):
+            question = preset_question or chat_input.value.strip()
+            if not question:
+                return
+            chat_input.value = ""
+            chat_history.append({"role": "user", "content": question})
+            chat_transcript.controls.append(
+                ft.Text(f"You: {question}", size=12, weight=ft.FontWeight.BOLD))
+            chat_input.disabled = True
+            send_button.disabled = True
+            explain_button.disabled = True
+            chat_progress.visible = True
+            page.update()
+
+            def worker():
+                reply = llm_summary.chat_reply(list(chat_history), q, snap, category)
+                chat_progress.visible = False
+                chat_input.disabled = False
+                send_button.disabled = False
+                explain_button.disabled = False
+                if reply:
+                    chat_history.append({"role": "assistant", "content": reply})
+                    chat_transcript.controls.append(ft.Text(reply, size=12, selectable=True))
+                    chat_disclaimer.visible = True
+                else:
+                    chat_transcript.controls.append(
+                        ft.Text("Local model unavailable right now.", size=12,
+                                italic=True, color=ft.Colors.RED_400))
+                page.update()
+
+            page.run_thread(worker)
+
+        def start_chat(e=None):
+            explain_button.visible = False
+            chat_row.visible = True
+            send_chat(preset_question="Explain this stock in plain language based on the data above.")
+
+        explain_button.on_click = start_chat
+        send_button.on_click = send_chat
+        chat_input.on_submit = send_chat
+        if llm_summary.is_ollama_available():
+            explain_button.visible = True
+
+        explain_col = ft.Column(
+            [ft.Row([explain_button]), chat_transcript, chat_row, chat_disclaimer],
+            spacing=6, tight=True,
+        )
+
         dialog = ft.AlertDialog(
             modal=True,
             title=ft.Text(f"{q.name or q.ticker}  ({q.ticker})"),
-            content=ft.Row(
-                [stats_col, ft.VerticalDivider(), ft.Column(right_controls)],
-                vertical_alignment=ft.CrossAxisAlignment.START,
-                spacing=16,
+            content=ft.Container(
+                width=760,
+                height=480,
+                content=ft.Column(
+                    [
+                        ft.Row(
+                            [stats_col, ft.VerticalDivider(), ft.Column(right_controls)],
+                            vertical_alignment=ft.CrossAxisAlignment.START,
+                            spacing=16,
+                        ),
+                        ft.Divider(),
+                        explain_col,
+                    ],
+                    scroll=ft.ScrollMode.AUTO,
+                    tight=True,
+                ),
             ),
             actions=[ft.TextButton("Close", on_click=lambda e: page.pop_dialog())],
         )
@@ -139,12 +285,16 @@ def main(page: ft.Page):
     nav_watchlist_btn = ft.Button("Watchlist", style=nav_style(True))
     nav_screener_btn = ft.Button("Screener", style=nav_style(False))
     nav_macro_btn = ft.Button("Macro", style=nav_style(False))
+    nav_chat_btn = ft.Button("Chat", style=nav_style(False))
+    nav_setup_btn = ft.Button("LLM Setup", style=nav_style(False))
 
     def set_view(view_name):
         state["view"] = view_name
         nav_watchlist_btn.style = nav_style(view_name == "watchlist")
         nav_screener_btn.style = nav_style(view_name == "screener")
         nav_macro_btn.style = nav_style(view_name == "macro")
+        nav_chat_btn.style = nav_style(view_name == "chat")
+        nav_setup_btn.style = nav_style(view_name == "setup")
         refresh_body()
         page.update()
         if view_name == "macro" and not state["macro_loaded"]:
@@ -153,6 +303,8 @@ def main(page: ft.Page):
     nav_watchlist_btn.on_click = lambda e: set_view("watchlist")
     nav_screener_btn.on_click = lambda e: set_view("screener")
     nav_macro_btn.on_click = lambda e: set_view("macro")
+    nav_chat_btn.on_click = lambda e: set_view("chat")
+    nav_setup_btn.on_click = lambda e: set_view("setup")
 
     # ------------------------------------------------------------------
     # Watchlist view
@@ -181,6 +333,20 @@ def main(page: ft.Page):
 
     add_ticker_field.on_submit = add_ticker
 
+    def _ticker_market(ticker: str) -> str:
+        return "India" if ticker.upper().endswith((".NS", ".BO")) else "US"
+
+    def _visible_watchlist() -> list[str]:
+        market = state["watchlist_filter"]
+        if market == "All":
+            return list(state["watchlist"])
+        return [t for t in state["watchlist"] if _ticker_market(t) == market]
+
+    def set_watchlist_filter(market: str) -> None:
+        state["watchlist_filter"] = market
+        refresh_body()
+        page.update()
+
     def refresh_watchlist_data(tickers=None):
         targets = tickers or list(state["watchlist"])
         if not targets:
@@ -206,7 +372,7 @@ def main(page: ft.Page):
 
     def watchlist_rows():
         rows = []
-        for tkr in state["watchlist"]:
+        for tkr in _visible_watchlist():
             q = state["quotes_cache"].get(tkr)
             if q is None:
                 rows.append(ft.DataRow(cells=[ft.DataCell(ft.Text(tkr))] +
@@ -248,6 +414,31 @@ def main(page: ft.Page):
             )
         return rows
 
+    def market_filter_style(active: bool):
+        return ft.ButtonStyle(
+            bgcolor=ft.Colors.BLUE_700 if active else ft.Colors.GREY_100,
+            color=ft.Colors.WHITE if active else ft.Colors.BLACK,
+        )
+
+    def build_market_filter_row():
+        current = state["watchlist_filter"]
+        counts = {
+            "All": len(state["watchlist"]),
+            "US": sum(1 for t in state["watchlist"] if _ticker_market(t) == "US"),
+            "India": sum(1 for t in state["watchlist"] if _ticker_market(t) == "India"),
+        }
+        return ft.Row(
+            [
+                ft.Button(f"All ({counts['All']})", style=market_filter_style(current == "All"),
+                          on_click=lambda e: set_watchlist_filter("All")),
+                ft.Button(f"US ({counts['US']})", style=market_filter_style(current == "US"),
+                          on_click=lambda e: set_watchlist_filter("US")),
+                ft.Button(f"India ({counts['India']})", style=market_filter_style(current == "India"),
+                          on_click=lambda e: set_watchlist_filter("India")),
+            ],
+            spacing=8,
+        )
+
     def build_watchlist_view():
         table = ft.DataTable(
             columns=[
@@ -279,6 +470,7 @@ def main(page: ft.Page):
                     wrap=True,
                     vertical_alignment=ft.CrossAxisAlignment.CENTER,
                 ),
+                build_market_filter_row(),
                 ft.Divider(),
                 ft.Row([table], scroll=ft.ScrollMode.AUTO),
             ],
@@ -379,7 +571,7 @@ def main(page: ft.Page):
                         ft.DataCell(ft.Text(r.category,
                                              color=CATEGORY_COLORS.get(r.category))),
                     ],
-                    on_select_change=lambda e, qq=q, ss=snap: show_detail(qq, ss),
+                    on_select_change=lambda e, qq=q, ss=snap, cat=r.category: show_detail(qq, ss, cat),
                 )
             )
         return rows
@@ -530,6 +722,325 @@ def main(page: ft.Page):
         )
 
     # ------------------------------------------------------------------
+    # Chat view (general market/investing discussion, local LLM)
+    # ------------------------------------------------------------------
+    def send_general_chat(e=None):
+        question = (chat_input_field.value or "").strip()
+        if not question:
+            return
+        session = get_current_chat()
+        chat_input_field.value = ""
+        session["messages"].append({"role": "user", "content": question})
+        if session["title"] == "New chat":
+            session["title"] = question[:48] + ("…" if len(question) > 48 else "")
+        _bump_to_top(session["id"])
+        storage.save_chat_sessions(state["chat_sessions"])
+        chat_progress.visible = True
+        chat_input_field.disabled = True
+        chat_send_btn.disabled = True
+        refresh_body()
+        page.update()
+
+        def worker():
+            reply = llm_summary.general_chat_reply(list(session["messages"]))
+            session["messages"].append({
+                "role": "assistant",
+                "content": reply or "Local model unavailable right now.",
+            })
+            _bump_to_top(session["id"])
+            storage.save_chat_sessions(state["chat_sessions"])
+            chat_progress.visible = False
+            chat_input_field.disabled = False
+            chat_send_btn.disabled = False
+            refresh_body()
+            page.update()
+
+        page.run_thread(worker)
+
+    chat_input_field.on_submit = send_general_chat
+    chat_send_btn.on_click = send_general_chat
+
+    def build_chat_history_panel():
+        # Collapsed: a thin strip on the left with just an expand handle
+        # and a "new chat" shortcut, so the transcript gets full width.
+        if state["chat_panel_collapsed"]:
+            return ft.Column(
+                [
+                    ft.IconButton(
+                        icon=ft.Icons.CHEVRON_RIGHT, tooltip="Show chat history",
+                        on_click=toggle_chat_panel,
+                    ),
+                    ft.IconButton(
+                        icon=ft.Icons.ADD_COMMENT_OUTLINED, tooltip="New chat",
+                        on_click=start_new_chat,
+                    ),
+                ],
+                width=44,
+                spacing=4,
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            )
+
+        items = []
+        for s in state["chat_sessions"]:
+            is_active = s["id"] == state["current_chat_id"]
+            items.append(
+                ft.Container(
+                    content=ft.Row(
+                        [
+                            ft.Text(
+                                s["title"], size=12, no_wrap=True,
+                                overflow=ft.TextOverflow.ELLIPSIS,
+                                weight=ft.FontWeight.BOLD if is_active else ft.FontWeight.NORMAL,
+                                expand=True,
+                            ),
+                            ft.IconButton(
+                                icon=ft.Icons.DELETE_OUTLINE, icon_size=14,
+                                tooltip="Delete chat",
+                                on_click=lambda e, cid=s["id"]: delete_chat(cid),
+                            ),
+                        ],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    ),
+                    padding=_padding_symmetric(horizontal=8, vertical=6),
+                    border_radius=6,
+                    bgcolor=ft.Colors.BLUE_50 if is_active else None,
+                    on_click=lambda e, cid=s["id"]: select_chat(cid),
+                    ink=True,
+                )
+            )
+        return ft.Column(
+            [
+                ft.Row(
+                    [
+                        ft.Button("+ New chat", on_click=start_new_chat, expand=True),
+                        ft.IconButton(
+                            icon=ft.Icons.CHEVRON_LEFT, tooltip="Hide chat history",
+                            on_click=toggle_chat_panel,
+                        ),
+                    ],
+                ),
+                ft.Divider(),
+                ft.Column(items, spacing=2, scroll=ft.ScrollMode.AUTO, expand=True)
+                if items else ft.Text("No past chats yet.", size=11, color=ft.Colors.GREY_600),
+            ],
+            width=220,
+            spacing=8,
+        )
+
+    def build_ollama_status_panel(available: bool):
+        models = llm_summary.list_installed_models() if available else []
+        model_names = ", ".join(m["name"] for m in models) if models else "none installed"
+
+        def refresh_status(e=None):
+            refresh_body()
+            page.update()
+
+        status_row = ft.Row(
+            [
+                ft.Icon(
+                    ft.Icons.CIRCLE, size=10,
+                    color=ft.Colors.GREEN if available else ft.Colors.RED,
+                ),
+                ft.Text(
+                    f"Ollama: {'running — ' + model_names if available else 'not reachable'}",
+                    size=12, weight=ft.FontWeight.BOLD,
+                ),
+                ft.IconButton(
+                    icon=ft.Icons.REFRESH, icon_size=16, tooltip="Re-check status",
+                    on_click=refresh_status,
+                ),
+            ],
+            spacing=6,
+        )
+
+        command_rows = []
+        for cmd in llm_summary.quick_commands():
+            command_rows.append(
+                ft.Column(
+                    [
+                        ft.Text(cmd["title"], size=12, weight=ft.FontWeight.W_500),
+                        ft.Row(
+                            [
+                                ft.Container(
+                                    content=ft.Text(
+                                        cmd["command"], size=12, selectable=True,
+                                        font_family="monospace",
+                                    ),
+                                    bgcolor=ft.Colors.GREY_100,
+                                    padding=_padding_symmetric(horizontal=10, vertical=6),
+                                    border_radius=6,
+                                    expand=True,
+                                ),
+                                ft.IconButton(
+                                    icon=ft.Icons.COPY_OUTLINED, icon_size=16,
+                                    tooltip="Copy command",
+                                    action=ft.CopyToClipboard(cmd["command"]),
+                                ),
+                            ],
+                            vertical_alignment=ft.CrossAxisAlignment.START,
+                        ),
+                    ],
+                    spacing=4,
+                )
+            )
+
+        is_android = llm_summary.is_android()
+        tile_title = "Run / verify qwen in Termux" if is_android else "Run / verify qwen"
+        tile_controls = [
+            ft.Container(
+                content=ft.Column(command_rows, spacing=10),
+                padding=_padding_symmetric(horizontal=8, vertical=8),
+            ),
+        ]
+        if is_android:
+            tile_controls.append(
+                ft.Container(
+                    content=ft.Text(
+                        llm_summary.ANDROID_CHAT_TIMING_NOTE, size=11,
+                        color=ft.Colors.GREY_700, italic=True,
+                    ),
+                    padding=_padding_symmetric(horizontal=8, vertical=4),
+                )
+            )
+            tile_controls.append(
+                ft.Container(
+                    content=ft.Button(
+                        "First-time setup instead? Open LLM Setup",
+                        on_click=lambda e: set_view("setup"),
+                    ),
+                    padding=_padding_symmetric(horizontal=8, vertical=4),
+                )
+            )
+
+        return ft.Column(
+            [
+                status_row,
+                ft.ExpansionTile(
+                    title=ft.Text(tile_title, size=12),
+                    expanded=not available,
+                    controls=tile_controls,
+                ),
+            ],
+            spacing=6,
+        )
+
+    def build_chat_view():
+        ollama_available = llm_summary.is_ollama_available()
+        status_panel = build_ollama_status_panel(ollama_available)
+
+        if not ollama_available:
+            return ft.Column(
+                [
+                    status_panel,
+                    ft.Divider(),
+                    ft.Text(
+                        llm_summary.unavailable_message(),
+                        size=13, color=ft.Colors.GREY_700,
+                    ),
+                ],
+                spacing=10,
+                expand=True,
+            )
+
+        session = get_current_chat()
+        messages_col = ft.Column(spacing=10, scroll=ft.ScrollMode.AUTO, expand=True)
+        if not session["messages"]:
+            messages_col.controls.append(ft.Text(
+                "Ask about market/investing concepts, technical indicators, or how to think "
+                "about screening strategy. This chat isn't connected to live prices, news, or "
+                "your own Watchlist/Screener data — use those tabs for that.",
+                size=12, color=ft.Colors.GREY_600,
+            ))
+        for msg in session["messages"]:
+            is_user = msg["role"] == "user"
+            messages_col.controls.append(
+                ft.Column(
+                    [
+                        ft.Text("You" if is_user else "Assistant", size=11,
+                                weight=ft.FontWeight.BOLD, color=ft.Colors.GREY_600),
+                        ft.Text(msg["content"], size=13, selectable=True),
+                    ],
+                    spacing=2,
+                )
+            )
+
+        chat_pane = ft.Column(
+            [
+                status_panel,
+                ft.Text(
+                    "General stock market chat, powered by a local model — not connected to "
+                    "live data or your portfolio.",
+                    size=11, color=ft.Colors.GREY_600,
+                ),
+                ft.Divider(),
+                ft.Container(content=messages_col, expand=True),
+                ft.Row([chat_input_field, chat_send_btn, chat_progress],
+                       vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                ft.Text(llm_summary.GENERAL_CHAT_DISCLAIMER, size=10, color=ft.Colors.GREY_600),
+            ],
+            expand=True,
+        )
+
+        return ft.Row(
+            [
+                build_chat_history_panel(),
+                ft.VerticalDivider(width=1),
+                chat_pane,
+            ],
+            expand=True,
+            vertical_alignment=ft.CrossAxisAlignment.START,
+        )
+
+    def build_setup_view():
+        step_rows = []
+        for step in llm_summary.TERMUX_SETUP_STEPS:
+            controls = [ft.Text(step["title"], size=14, weight=ft.FontWeight.BOLD)]
+            if step.get("detail"):
+                controls.append(ft.Text(step["detail"], size=12, color=ft.Colors.GREY_700))
+            if step.get("command"):
+                controls.append(
+                    ft.Row(
+                        [
+                            ft.Container(
+                                content=ft.Text(
+                                    step["command"], size=12, selectable=True,
+                                    font_family="monospace",
+                                ),
+                                bgcolor=ft.Colors.GREY_100,
+                                padding=_padding_symmetric(horizontal=10, vertical=8),
+                                border_radius=6,
+                                expand=True,
+                            ),
+                            ft.IconButton(
+                                icon=ft.Icons.COPY_OUTLINED,
+                                tooltip="Copy command",
+                                action=ft.CopyToClipboard(step["command"]),
+                            ),
+                        ],
+                        vertical_alignment=ft.CrossAxisAlignment.START,
+                    )
+                )
+            step_rows.append(ft.Column(controls, spacing=6))
+            step_rows.append(ft.Divider())
+
+        return ft.Column(
+            [
+                ft.Text("Run Ollama locally via Termux (Android)", size=18,
+                        weight=ft.FontWeight.BOLD),
+                ft.Text(
+                    "Run each command below in Termux, in order. Tap the copy icon, "
+                    "then paste into Termux and press Enter. Once step 9 succeeds, "
+                    "come back and reopen the Chat tab.",
+                    size=12, color=ft.Colors.GREY_700,
+                ),
+                ft.Divider(),
+                ft.Column(step_rows, scroll=ft.ScrollMode.AUTO, expand=True, spacing=4),
+            ],
+            expand=True,
+            spacing=10,
+        )
+
+    # ------------------------------------------------------------------
     # Wiring
     # ------------------------------------------------------------------
     def refresh_body():
@@ -537,13 +1048,31 @@ def main(page: ft.Page):
             body.content = build_watchlist_view()
         elif state["view"] == "screener":
             body.content = build_screener_view()
+        elif state["view"] == "chat":
+            body.content = build_chat_view()
+        elif state["view"] == "setup":
+            body.content = build_setup_view()
         else:
             body.content = build_macro_view()
 
+    nav_buttons = [nav_watchlist_btn, nav_screener_btn, nav_macro_btn, nav_chat_btn]
+    if llm_summary.is_android():
+        # The "LLM Setup" tab only has Termux/Android instructions - on
+        # desktop, Ollama is just a normal local install, so it doesn't apply.
+        nav_buttons.append(nav_setup_btn)
+
     page.add(
-        ft.Row([nav_watchlist_btn, nav_screener_btn, nav_macro_btn], spacing=10),
-        ft.Divider(),
-        body,
+        ft.SafeArea(
+            ft.Column(
+                [
+                    ft.Row(nav_buttons, spacing=10, scroll=ft.ScrollMode.AUTO),
+                    ft.Divider(),
+                    body,
+                ],
+                expand=True,
+            ),
+            expand=True,
+        ),
     )
     refresh_body()
     page.update()

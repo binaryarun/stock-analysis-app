@@ -22,6 +22,20 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
+### Quick start (venv already set up)
+
+If `venv/` already exists in the repo (it does by default here), you can
+skip straight to running it:
+
+```bash
+cd stock_analysis_app
+source venv/bin/activate
+flet run main.py
+```
+
+See [Running it](#running-it) below for the browser-tab alternative and
+what to expect on first launch.
+
 ## What it does
 
 **Watchlist** — your own list of tickers (defaults to a starter mix of NSE
@@ -53,6 +67,13 @@ net importer"). These notes are generic finance-101 relationships, not
 predictions and not derived from news or sentiment — useful context, not a
 signal to act on by itself.
 
+**Chat** — an optional tab for general stock-market/investing discussion
+(terminology, indicators, how to think about screening) powered by a local
+LLM via Ollama. It has no access to live prices, news, or your own
+Watchlist/Screener data (use those tabs for that), and it isn't a
+financial advisor — see [Optional: local "Explain this" summaries](#optional-local-explain-this-summaries)
+below. The tab is hidden if Ollama isn't running.
+
 All the screening logic lives in `analysis.py` as plain, readable rules —
 no opaque "AI score." Treat flagged stocks as a starting point for your own
 research.
@@ -68,6 +89,89 @@ needed.
 
 This needs a normal internet connection (not a restricted/proxied network)
 to reach Yahoo Finance.
+
+## Optional: local "Explain this" summaries & Chat
+
+Two local-LLM features, both served by [Ollama](https://ollama.com) over
+loopback only (`localhost:11434`, no other network calls at runtime):
+
+- **Detail view chat** — click any row, then "Explain this," to open a
+  chat about that specific stock (`llm_summary.chat_reply`). Its data
+  (price, RSI, SMAs, trend, flags, category) is re-injected as context on
+  every turn, so it can only restate/explain what `analysis.py` already
+  computed — it will decline follow-up questions about anything not in
+  that data (e.g. news) rather than guess.
+- **Chat tab** — a top-level tab for general market/investing discussion,
+  not tied to one stock (`llm_summary.general_chat_reply`). This one may
+  use the model's own general knowledge to explain concepts (RSI, golden
+  cross, order types, etc.), but has no live prices/news/portfolio access
+  and is instructed to stay on stock-market topics. Conversations are
+  saved as named sessions in a history panel on the left of the tab (title
+  taken from your first message), so past chats persist across app
+  restarts at `~/.stock_analysis_tool/chat_sessions.json`; click **+ New
+  chat** to start a fresh conversation, click a past session to reopen it,
+  or delete one with its trash icon. With small (~3B)
+  models this topic restriction is a soft, prompt-only guardrail — it
+  reliably declines live-data questions, but may not always refuse a
+  fully off-topic request (e.g. asked to write a poem, it may just write
+  one). It has never been observed to fabricate stock data/prices.
+
+The app works fully without it: if Ollama isn't installed or isn't
+running, the button just stays hidden. It doesn't require one specific
+model — it auto-picks from whatever you've already pulled locally
+(preferring a small instruct model like `qwen`/`phi3`/`gemma2` if
+present, otherwise whatever's installed).
+
+To enable it:
+
+**Desktop (macOS/Linux):**
+```bash
+# Install Ollama (https://ollama.com/download), then pull a small model:
+ollama pull qwen2.5:3b-instruct    # or any small instruct model you prefer
+ollama serve                        # if not already running as a background service
+```
+
+**Android (via Termux, no root needed):** install [Termux](https://f-droid.org/en/packages/com.termux/)
+from F-Droid (not Play Store — that build is outdated), then either:
+
+- **Single-paste command** — open Termux and paste this whole line, then
+  press Enter. It installs Ollama, starts the server, and pulls a small
+  model in one go (the app's Chat tab shows this exact command too, so
+  you can copy it straight from the phone):
+  ```bash
+  pkg update -y && pkg upgrade -y && pkg install -y wget termux-api proot && termux-wake-lock && wget -O ollama-linux-arm64.tgz https://ollama.com/download/ollama-linux-arm64.tgz && tar -C $PREFIX -xzf ollama-linux-arm64.tgz && rm ollama-linux-arm64.tgz && nohup ollama serve > $HOME/ollama.log 2>&1 & sleep 3 && (ollama pull qwen2.5:3b-instruct || ollama pull qwen:2b) && curl -sf http://localhost:11434/api/tags && echo '' && echo 'Ollama is reachable.'
+  ```
+- **Or run the script** — `scripts/setup_ollama_termux.sh` does the same
+  thing, with more comments/output if you want to see each step.
+
+Either way, Termux must keep running in the background afterward
+(Android Settings > Apps > Termux > Battery > disable optimization), and
+the app's Chat tab picks it up automatically — no app-side configuration
+needed, since Termux and the app share the phone's network stack and both
+reach `localhost:11434`. For Ollama to survive a reboot, install
+[Termux:Boot](https://f-droid.org/packages/com.termux.boot/) and copy
+`scripts/termux_boot_ollama.sh` to `~/.termux/boot/`.
+
+### Testing "Explain this" on macOS
+
+1. Make sure Ollama is running (`Ollama.app`, or `ollama serve` in a
+   terminal) with at least one small model pulled (see above).
+2. From the venv, run the app: `flet run main.py`.
+3. Go to **Watchlist** or run a **Screener** scan, then click any row to
+   open the detail dialog.
+4. An **"Explain this"** button (sparkle icon) appears near the bottom of
+   the dialog — it only shows up when `llm_summary.is_ollama_available()`
+   returns true.
+5. Click it: you should see a brief loading spinner, then a 1-3 sentence
+   plain-English summary plus the disclaimer text underneath.
+
+Worth spot-checking while testing:
+- A **Neutral** result (no flags) — the summary should not invent a
+  signal that isn't there.
+- That the UI stays responsive (you can still interact with the dialog)
+  while the summary is loading, since the call runs off the UI thread.
+- With Ollama stopped, the button should simply not appear, with no
+  crash or delay elsewhere in the app.
 
 ## Running it
 
@@ -86,9 +190,11 @@ quotes in the background — give it a few seconds on slower connections.
 
 ## Where your data lives
 
-Your watchlist is saved locally at `~/.stock_analysis_tool/watchlist.json`.
-Nothing is sent anywhere except requests to Yahoo Finance for quotes — no
-cloud sync, no telemetry, no accounts.
+Your watchlist is saved locally at `~/.stock_analysis_tool/watchlist.json`,
+and general Chat tab conversations are saved locally at
+`~/.stock_analysis_tool/chat_sessions.json`. Nothing is sent anywhere
+except requests to Yahoo Finance for quotes and, if enabled, your local
+Ollama instance for chat — no cloud sync, no telemetry, no accounts.
 
 ## Packaging as a standalone app
 
@@ -124,6 +230,7 @@ charting.py          matplotlib price/RSI chart rendered as an in-app image
 universe.py          Nifty 50 / Dow 30 / S&P 500 ticker lists + default watchlist
 storage.py           Local JSON persistence for your watchlist
 formatting.py        Number/currency/percent display helpers
+llm_summary.py        Optional "Explain this" local LLM summary (Ollama)
 requirements.txt
 ```
 

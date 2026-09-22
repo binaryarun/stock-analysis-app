@@ -1,6 +1,7 @@
 flet>=0.85.0
 yfinance>=1.4.0
-pandas>=2.0
-numpy>=1.24
-matplotlib>=3.8
+pandas==3.0.3
+numpy==2.4.6
+matplotlib==3.10.9
 requests>=2.30
+tzdata>=2026.1
